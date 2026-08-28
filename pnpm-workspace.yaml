@@ -1,0 +1,17 @@
+packages:
+  - 'apps/*'
+  - 'backend/*'
+  - 'packages/*'
+  - 'integrations/*'
+  - 'ai/*'
+overrides:
+  deepmerge-ts: 8.0.1
+allowBuilds:
+  '@parcel/watcher': true
+  '@prisma/engines': true
+  '@scarf/scarf': true
+  '@swc/core': true
+  msgpackr-extract: true
+  prisma: true
+  protobufjs: true
+  unrs-resolver: true

@@ -1,0 +1,31 @@
+{
+  "name": "Mohamy-pro",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "dev:api": "pnpm --filter api start:dev",
+    "dev:web": "pnpm --filter @mohamy/web dev",
+    "lint": "pnpm --filter api exec eslint \"src/**/*.ts\"",
+    "test": "pnpm --filter api exec jest --runInBand && pnpm --filter @mohamy/web test",
+    "build": "pnpm --filter api run build && pnpm --filter @mohamy/web run build",
+    "db:validate": "pnpm --filter api exec prisma validate",
+    "db:generate": "pnpm --filter api exec prisma generate",
+    "db:deploy": "pnpm --filter api exec prisma migrate deploy",
+    "db:check": "pnpm --filter api run db:check",
+    "architecture:check": "node scripts/check-architecture.mjs",
+    "license:check": "node scripts/check-licenses.mjs"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "packageManager": "pnpm@11.22.0",
+  "devEngines": {
+    "packageManager": {
+      "name": "pnpm",
+      "version": "11.22.0",
+      "onFail": "download"
+    }
+  },
+  "type": "module"
+}

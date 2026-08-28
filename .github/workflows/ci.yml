@@ -1,0 +1,346 @@
+name: CI Pipeline
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+  security-events: write
+
+env:
+  PNPM_VERSION: 11.22.0
+  DATABASE_URL: postgresql://mohamy:mohamy_password@localhost:5432/mohamy_pro?schema=public
+  NODE_ENV: test
+  REDIS_URL: redis://localhost:6379
+  S3_ENDPOINT: http://localhost:9000
+  S3_ACCESS_KEY: minioadmin
+  S3_SECRET_KEY: minioadmin
+  S3_BUCKET: mohamy-ci
+  CORS_ORIGINS: http://localhost:3000
+
+jobs:
+  quality:
+    name: Quality, integration, and e2e
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: mohamy
+          POSTGRES_PASSWORD: mohamy_password
+          POSTGRES_DB: mohamy_pro
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U mohamy -d mohamy_pro"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: ${{ env.PNPM_VERSION }}
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: pnpm
+
+      - name: Start pinned MinIO
+        run: |
+          docker run --detach --name mohamy-ci-minio \
+            --publish 9000:9000 --publish 9001:9001 \
+            --env MINIO_ROOT_USER=minioadmin \
+            --env MINIO_ROOT_PASSWORD=minioadmin \
+            minio/minio:RELEASE.2025-09-07T16-13-09Z \
+            server /data --console-address ":9001"
+          for attempt in $(seq 1 30); do
+            if curl --fail --silent http://127.0.0.1:9000/minio/health/live > /dev/null; then
+              exit 0
+            fi
+            sleep 2
+          done
+          docker logs mohamy-ci-minio
+          exit 1
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Validate architecture boundaries
+        run: pnpm architecture:check
+
+      - name: Validate Prisma schema
+        run: pnpm --filter api exec prisma validate
+
+      - name: Generate Prisma Client
+        run: pnpm --filter api exec prisma generate
+
+      - name: Apply migrations
+        run: pnpm --filter api exec prisma migrate deploy
+
+      - name: Verify migration history
+        run: pnpm db:check
+
+      - name: Lint API and test sources
+        run: pnpm --filter api exec eslint "{src,apps,libs,test}/**/*.ts"
+
+      - name: Test API with coverage threshold
+        run: pnpm --filter api run test:cov
+
+      - name: Test API contract end to end
+        run: pnpm --filter api run test:e2e
+
+      - name: Build API
+        run: pnpm --filter api run build
+
+      - name: Test frontend
+        run: pnpm --filter @mohamy/web test
+
+      - name: Build frontend
+        run: pnpm --filter @mohamy/web run build
+
+      - name: Stop pinned MinIO
+        if: always()
+        run: docker rm --force mohamy-ci-minio || true
+
+      - name: Upload API coverage
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: api-coverage-${{ github.sha }}
+          path: backend/api/coverage
+          if-no-files-found: warn
+          retention-days: 14
+
+  dependency-review:
+    name: Dependency and license policy
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Dependency review
+        uses: actions/dependency-review-action@v4
+        with:
+          fail-on-severity: high
+          deny-licenses: GPL-3.0,AGPL-3.0
+
+  security:
+    name: Static security and supply chain
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: ${{ env.PNPM_VERSION }}
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Dependency audit
+        run: pnpm audit --audit-level high
+
+      - name: License policy
+        run: pnpm license:check
+
+      - name: Gitleaks secret scan
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Semgrep SAST
+        uses: semgrep/semgrep-action@v1
+        with:
+          config: p/ci
+
+      - name: Trivy filesystem scan
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          format: sarif
+          output: trivy-fs.sarif
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+
+      - name: Upload Trivy SARIF
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-fs.sarif
+
+      - name: Generate source SBOM
+        uses: anchore/sbom-action@v0
+        with:
+          path: .
+          format: cyclonedx-json
+          output-file: sbom.cdx.json
+          artifact-name: sbom-${{ github.sha }}.cdx.json
+
+  container:
+    name: Container build and scan
+    needs: quality
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build API image
+        run: docker build --file backend/api/Dockerfile --tag mohamy-api:${{ github.sha }} .
+
+      - name: Scan API image
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: mohamy-api:${{ github.sha }}
+          format: sarif
+          output: trivy-image.sarif
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+
+      - name: Upload image scan SARIF
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-image.sarif
+
+      - name: Generate image SBOM
+        uses: anchore/sbom-action@v0
+        with:
+          image: mohamy-api:${{ github.sha }}
+          format: cyclonedx-json
+          output-file: api-image-sbom.cdx.json
+          artifact-name: api-image-sbom-${{ github.sha }}.cdx.json
+
+  dast:
+    name: Dynamic API security baseline
+    needs: quality
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: mohamy
+          POSTGRES_PASSWORD: mohamy_password
+          POSTGRES_DB: mohamy_pro
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U mohamy -d mohamy_pro"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: ${{ env.PNPM_VERSION }}
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: pnpm
+
+      - name: Start pinned MinIO
+        run: |
+          docker run --detach --name mohamy-ci-minio \
+            --publish 9000:9000 --publish 9001:9001 \
+            --env MINIO_ROOT_USER=minioadmin \
+            --env MINIO_ROOT_PASSWORD=minioadmin \
+            minio/minio:RELEASE.2025-09-07T16-13-09Z \
+            server /data --console-address ":9001"
+          for attempt in $(seq 1 30); do
+            if curl --fail --silent http://127.0.0.1:9000/minio/health/live > /dev/null; then
+              exit 0
+            fi
+            sleep 2
+          done
+          docker logs mohamy-ci-minio
+          exit 1
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Prepare database
+        run: |
+          pnpm --filter api exec prisma generate
+          pnpm --filter api exec prisma migrate deploy
+
+      - name: Start API
+        run: |
+          pnpm --filter api start:dev > api.log 2>&1 &
+          echo $! > api.pid
+          for attempt in $(seq 1 30); do
+            if curl --fail --silent http://127.0.0.1:3000/api/v1/health/live > /dev/null; then
+              exit 0
+            fi
+            sleep 2
+          done
+          cat api.log
+          exit 1
+
+      - name: OWASP ZAP baseline scan
+        run: |
+          mkdir -p zap-output
+          chmod 777 zap-output
+          docker run --rm --network host \
+            -v "$PWD/zap-output:/zap/wrk/:rw" \
+            ghcr.io/zaproxy/zaproxy:stable \
+            zap-baseline.py -t http://127.0.0.1:3000/api/docs -r zap-report.html -J zap-report.json -m 2 -I
+
+      - name: Stop pinned MinIO
+        if: always()
+        run: docker rm --force mohamy-ci-minio || true
+
+      - name: Upload DAST report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: zap-report-${{ github.sha }}
+          path: |
+            zap-output/zap-report.html
+            zap-output/zap-report.json
+            api.log
+          if-no-files-found: warn
+          retention-days: 14
